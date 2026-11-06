@@ -393,9 +393,13 @@ def selftest():
     assert msg[4] == "goog_TEST" and msg[13] == "zh-CN" and msg[34] == "Asia/Shanghai"
     assert '["FILEID1234567890abcdefgh",null,"application/pdf"]' in raw   # 文件ID+mime 位
     assert '"提示词内容"' in raw
-    # 3) 文本提取：优先取最后一条消息的完整 Markdown；旧格式仍走启发式
-    primary = [[[[[[["完整摘要内容"]]]]]]]
-    assert extract_text(json.dumps([[primary]])) == "完整摘要内容"
+    # 3) 文本提取：优先取最后一条消息的完整 Markdown（≥20 字才走主路径）；
+    #    构造"主文本+同消息噪音"——若主路径失效退回启发式，噪音会混入导致断言失败
+    LONG = "这是主路径应当返回的完整摘要正文内容共超过二十个字符"
+    NOISE = "这是回退路径才会混进来的额外噪音文本同样超过二十个字符"
+    primary = [[[[[[[LONG, ["x", NOISE]]]]]]]]
+    assert _primary_message_text(primary) == LONG
+    assert extract_text(json.dumps([[primary]])) == LONG
     chunk = lambda s: [[[[[[s, ["x", s]]]]]]]      # 每条流式消息的嵌套形态
     resp = json.dumps([chunk("完整摘要第一段内容在此"),
                        chunk("完整摘要第一段内容在此还有第二段")])
