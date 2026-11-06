@@ -46,7 +46,7 @@ def load_config(path: str) -> dict:
     cfg = {"cookie_file": "cookies.json", "prompt": "总结这份文件的要点。",
            "locale": "zh-CN", "timezone": "Asia/Shanghai",
            "api_key": None, "host": None, "client_build": None,
-           "_fetched_at": 0, "_build_src": "builtin"}
+           "_fetched_at": 0}
     if os.path.exists(path):
         try:
             cfg.update(json.load(open(path, encoding="utf-8")))
@@ -54,7 +54,7 @@ def load_config(path: str) -> dict:
             die(5, f"配置文件解析失败 {path}: {e}")
     else:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        json.dump(cfg, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        save_config(path, cfg)      # 原子写 + chmod 600（首次创建同样受保护）
         print(f"已生成配置模板: {path}\n请把 cookie 存到 "
               f"{os.path.join(os.path.dirname(os.path.abspath(path)), cfg['cookie_file'])}"
               f"（JSON，多键随意，自动定位含 SAPISID 的值）", file=sys.stderr)
@@ -116,6 +116,8 @@ def load_cookie(cfg: dict, cfg_path: str, cookie_file: str = None, cookie_key: s
                f'  {{"openai": "sk-...", "google": "SID=...; SAPISID=...; HSID=..."}}\n'
                f"获取: 已登录浏览器 F12 → Network → 过滤 appsgenaiserver → 点一条请求 → "
                f"Request Headers → cookie 整串（或 Copy as cURL 命令）填进任意键值")
+    if (os.stat(cf).st_mode & 0o077) and os.name != "nt":
+        print(f"[cookie] 警告: {cf} 对组/其他用户可读，建议 chmod 600 {cf}", file=sys.stderr)
     content = open(cf, encoding="utf-8").read().strip()
     try:
         data = json.loads(content)
@@ -139,6 +141,10 @@ def load_cookie(cfg: dict, cfg_path: str, cookie_file: str = None, cookie_key: s
     return from_curl(val)
 
 # ---------------- 自动抓取 key/host（+顺带尝试构建号） ----------------
+def build_autofill_allowed(cfg: dict) -> bool:
+    """只有空值或内置默认值才允许自动填充；任何非默认手填值都视为用户意图，不覆盖"""
+    return not cfg.get("client_build") or cfg.get("client_build") == DEFAULT_BUILD
+
 def autodiscover(file_id: str, cfg: dict, cfg_path: str):
     fresh = time.time() - cfg.get("_fetched_at", 0) < REFRESH_AFTER
     if cfg.get("api_key") and cfg.get("host") and fresh:
@@ -151,8 +157,8 @@ def autodiscover(file_id: str, cfg: dict, cfg_path: str):
         if m:
             cfg["api_key"], cfg["host"] = m.group(1), m.group(2)
         b = re.search(r'goog_\d{6,}', html)      # 登录态 HTML 才可能有；匿名通常没有
-        if b and cfg.get("_build_src") != "manual":
-            cfg["client_build"], cfg["_build_src"] = b.group(0), "auto"
+        if b and build_autofill_allowed(cfg):
+            cfg["client_build"] = b.group(0)
         cfg["_fetched_at"] = int(time.time())
         save_config(cfg_path, cfg)
     except Exception:
@@ -249,9 +255,22 @@ def parse_file_id(target: str) -> str:
     return m.group(1) if m else target
 
 def parse_quota(body: str) -> str:
-    """quotaSummary JSON-protobuf → 可读行。ponytail: 字段语义未逆向，取前两个数字串按 剩余/总量 展示（启发式）"""
+    """quotaSummary JSON-protobuf → 可读行。字段语义未逆向，按出现顺序取前两个数字启发式展示。
+    json.loads 递归收集，兼容带引号/不带引号的数字。"""
     try:
-        nums = [s for s in re.findall(r'\"(\d+)\"', body)]
+        nums = []
+        def walk(n):
+            if len(nums) >= 2: return
+            if isinstance(n, bool): return
+            if isinstance(n, (int, float)):
+                nums.append(n)
+            elif isinstance(n, str) and re.fullmatch(r"\d+(\.\d+)?", n):
+                nums.append(n)
+            elif isinstance(n, list):
+                for v in n: walk(v)
+            elif isinstance(n, dict):
+                for v in n.values(): walk(v)
+        walk(json.loads(body))
         if len(nums) >= 2:
             return f"[quota] 剩余 {nums[0]} / 总量 {nums[1]}（字段语义为启发式解读）"
     except Exception:
@@ -267,6 +286,7 @@ def main():
     ap.add_argument("--out", help="输出到文件（默认 stdout）")
     ap.add_argument("--cookie-file", help="cookie JSON 文件路径（任意位置；最高优先级）")
     ap.add_argument("--cookie-key", help="JSON 里有多个候选时指定用哪个键（默认第一个并打印）")
+    ap.add_argument("--client-build", help="手工指定客户端构建号（如 goog_1234567890），写入配置持久生效")
     ap.add_argument("--quota", action="store_true", help="只查配额（可不带文件链接）")
     ap.add_argument("--selftest", action="store_true", help="离线自检（不联网）")
     args = ap.parse_args()
@@ -275,6 +295,10 @@ def main():
         selftest(); print("selftest OK"); return
 
     cfg = load_config(args.config)
+    if args.client_build:          # 手工指定：持久写入；非默认值后自动发现不会再覆盖
+        cfg["client_build"] = args.client_build
+        save_config(args.config, cfg)
+        print(f"[config] client_build 已设为 {args.client_build}", file=sys.stderr)
     cookie = load_cookie(cfg, args.config, args.cookie_file, args.cookie_key)
 
     if args.quota and not args.target:      # 配额查询不依赖具体文件
@@ -287,12 +311,20 @@ def main():
         autodiscover(file_id, cfg, args.config)
 
     if args.quota:
-        code, body = post(f"https://{cfg['host']}/v1/genai/quotaSummary?key={cfg['api_key']}",
-                          "[null,1,[19]]", cookie, timeout=30)
-        if code == 404:   # key/host 过期：清缓存重发现一次再试
-            cfg.update({"api_key": None, "host": None, "_fetched_at": 0})
-            save_config(args.config, cfg)
-            die(4, "404：缓存的 api_key/host 已失效，已自动清空，请重跑本命令重新发现")
+        def quota_url():
+            return f"https://{cfg['host']}/v1/genai/quotaSummary?key={cfg['api_key']}"
+        code, body = post(quota_url(), "[null,1,[19]]", cookie, timeout=30)
+        if code in (403, 404):   # key/host 过期：与生成分支一致，重发现一次再试
+            if args.target:
+                print(f"[retry] {code} → 清空缓存 key/host 重新自动发现", file=sys.stderr)
+                cfg.update({"api_key": None, "host": None, "_fetched_at": 0})
+                autodiscover(file_id, cfg, args.config)
+                code, body = post(quota_url(), "[null,1,[19]]", cookie, timeout=30)
+            else:
+                cfg.update({"api_key": None, "host": None, "_fetched_at": 0})
+                save_config(args.config, cfg)
+                die(4, f"{code}：缓存的 api_key/host 已失效并已清空——"
+                       f"请带任意 Drive 文件链接跑一次以重新发现")
         status_exit(code, body)
         print(parse_quota(body))
         print(body); return
@@ -310,6 +342,8 @@ def main():
     text = extract_text(body)
     if args.out:
         open(args.out, "w", encoding="utf-8").write(text + "\n")
+        if os.name != "nt":
+            os.chmod(args.out, 0o600)     # 摘要含文件内容，默认仅本人可读
         print(f"已写入 {args.out}", file=sys.stderr)
     else:
         print(text)
@@ -350,6 +384,11 @@ def selftest():
     assert parse_file_id(fid) == fid
     assert extract_text(json.dumps({"k": [[[[[[["从dict里冒出来的文本内容", ["x"]]]]]]]]})) == "从dict里冒出来的文本内容"
     assert "剩余" in parse_quota('[[null,["999999",null,"888",3]]]')
+    # 6) 配额解析兼容不带引号数字；构建号自动填充规则（空/默认→允许，手填非默认→保护）
+    assert "999999" in parse_quota('[[null,[999999,null,888,3]]]')
+    assert build_autofill_allowed({"client_build": None}) is True
+    assert build_autofill_allowed({"client_build": DEFAULT_BUILD}) is True
+    assert build_autofill_allowed({"client_build": "goog_9999999999"}) is False
 
 if __name__ == "__main__":
     main()
