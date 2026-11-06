@@ -42,8 +42,12 @@ python3 drive_summarize.py --selftest           # offline checks, no network
 ```
 
 Everything else is automatic: API key & host are fetched from the Drive page and cached,
-`SAPISIDHASH` and UUIDs are generated per request. Exit codes: `0` ok, `2` auth (re-export
-cookies), `3` quota, `4` protocol change (update `client_build`), `5` config missing.
+`SAPISIDHASH` and UUIDs are generated per request. On a stale cached key the CLI
+re-discovers it once automatically. Exit codes: `0` ok, `2` auth (re-export cookies),
+`3` quota, `4` protocol/API error (key, host, permissions, or `client_build` drift),
+`5` config missing, `6` network error.
+
+Cookie precedence: `--cookie-file` arg > `DRIVE_COOKIE_FILE` / `DRIVE_COOKIE` env > config.
 
 ## Repo layout
 

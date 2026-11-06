@@ -18,16 +18,18 @@ Drive Gemini 摘要 CLI — 纯 HTTP 复放（协议规格见 AGENT_SPEC.md）
   api_key/host    自动抓取后回写缓存，一般不用动
   client_build    客户端构建号：自动尝试，抓不到时用内置值；失效(400)时手工更新（见 AGENT_SPEC §6.1）
 
-Cookie 文件（--cookie-file 可传任意路径，优先级：参数 > 环境变量 > 配置）：
+Cookie 文件（--cookie-file 可传任意路径）。优先级（高→低）：
+  1. --cookie-file 参数
+  2. 环境变量 DRIVE_COOKIE_FILE（文件）/ DRIVE_COOKIE（整串值）
+  3. 配置文件里的 cookie_file（相对 config 所在目录）
   JSON 格式，多键无所谓 —— 递归自动定位含 SAPISID 的那个值，支持三种形态：
     {"google": "SID=...; SAPISID=...; HSID=..."}          ← 值=整串 cookie
     {"google": "curl '...' -H 'cookie: SID=...;'"}        ← 值=Copy as cURL 命令
     {"google": {"SID": "...", "SAPISID": "...", ...}}     ← 值=扁平 cookie 映射
   多个账号候选时默认用第一个，--cookie-key <键名> 指定；运行时会打印用了哪个键。
-环境变量: DRIVE_COOKIE（整串值直接覆盖）/ DRIVE_COOKIE_FILE / DRIVE_CONFIG。
-退出码: 0 成功 | 2 鉴权失败 | 3 配额 | 4 协议变更(400) | 5 配置缺失
+退出码: 0 成功 | 2 鉴权失败 | 3 配额 | 4 协议/接口错误 | 5 配置缺失 | 6 网络异常
 """
-import argparse, hashlib, json, os, re, sys, time, urllib.request, uuid
+import argparse, hashlib, json, os, re, ssl, sys, tempfile, time, urllib.request, uuid
 
 # ---- 内置兜底值（自动抓取失败时使用；来源见 AGENT_SPEC） ----
 DEFAULT_KEY = "AIzaSyDVQw45DwoYh632gvsP5vPDqEKvb-Ywnb8"
@@ -59,17 +61,26 @@ def load_config(path: str) -> dict:
     return cfg
 
 def save_config(path: str, cfg: dict):
-    tmp = {k: v for k, v in cfg.items()}
-    json.dump(tmp, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    """原子写入（tmpfile + rename），防并发/中断留下半截 JSON；chmod 600（含 cookie 路径等信息）"""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        os.unlink(tmp) if os.path.exists(tmp) else None
+        raise
 
 # ---------------- Cookie ----------------
 def from_curl(text: str) -> str:
     """Copy as cURL 粘贴 → 抽 cookie 头；非 cURL 原样返回"""
     if not text.lstrip().startswith("curl "):
         return text.strip().rstrip(";")
-    m = (re.search(r"-H\s+[\"']cookie:\s*([^\"']+)[\"']", text, re.I)
-         or re.search(r"--cookie\s+[\"']([^\"']+)[\"']", text, re.I))
-    if not m: die(5, "从 cURL 命令里没找到 cookie 头")
+    m = (re.search(r"(?:-H|--header)\s+[\"']cookie:\s*([^\"']+)[\"']", text, re.I)
+         or re.search(r"(?:--cookie|-b)\s+[\"']([^\"']+)[\"']", text, re.I))
+    if not m: die(5, "从 cURL 命令里没找到 cookie 头（支持 -H/--header 'cookie:'、--cookie、-b）")
     return m.group(1).strip().rstrip(";")
 
 def find_cookie_values(node, path="$"):
@@ -91,11 +102,15 @@ def find_cookie_values(node, path="$"):
     return strs + maps
 
 def load_cookie(cfg: dict, cfg_path: str, cookie_file: str = None, cookie_key: str = None) -> str:
-    raw = os.environ.get("DRIVE_COOKIE")
-    if raw:
-        return from_curl(raw)
-    cf = (cookie_file or os.environ.get("DRIVE_COOKIE_FILE")
-          or os.path.join(os.path.dirname(os.path.abspath(cfg_path)), cfg["cookie_file"]))
+    # 优先级：显式 --cookie-file > DRIVE_COOKIE_FILE > DRIVE_COOKIE（整串值）> 配置
+    if cookie_file:
+        cf = cookie_file
+    elif os.environ.get("DRIVE_COOKIE_FILE"):
+        cf = os.environ["DRIVE_COOKIE_FILE"]
+    elif os.environ.get("DRIVE_COOKIE"):
+        return from_curl(os.environ["DRIVE_COOKIE"])
+    else:
+        cf = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), cfg["cookie_file"])
     if not os.path.exists(cf):
         die(5, f"缺少 cookie 文件 {cf}\nJSON 格式示例（多键随意，会自动定位含 SAPISID 的值）:\n"
                f'  {{"openai": "sk-...", "google": "SID=...; SAPISID=...; HSID=..."}}\n'
@@ -150,8 +165,9 @@ def autodiscover(file_id: str, cfg: dict, cfg_path: str):
 def sapisidhash(cookie: str) -> str:
     m = re.search(r"(?:^|;\s*)SAPISID=([^;]+)", cookie)
     if not m: die(5, "cookie 串里找不到 SAPISID（确认复制的是完整请求头 cookie）")
+    sid = m.group(1).strip()          # 尾部空格会导致 hash 不一致
     t = int(time.time())
-    sig = f"{t}_{hashlib.sha1(f'{t} {m.group(1)} {ORIGIN}'.encode()).hexdigest()}"
+    sig = f"{t}_{hashlib.sha1(f'{t} {sid} {ORIGIN}'.encode()).hexdigest()}"
     return f"SAPISIDHASH {sig}"
 
 def build_body(file_id: str, prompt: str, cfg: dict) -> str:
@@ -188,6 +204,8 @@ def extract_text(resp: str) -> str:
             keep.append(n)
         elif isinstance(n, list):
             for x in n: walk(x)
+        elif isinstance(n, dict):
+            for v in n.values(): walk(v)
     walk(tree)
     return "\n".join(keep)
 
@@ -204,50 +222,90 @@ def post(url: str, body: str, cookie: str, timeout: int = 180):
             return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, ssl.SSLError, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        die(6, f"网络异常: {reason}\n检查网络/代理后重试")
 
 def status_exit(code: int, body: str) -> int:
     if code == 200: return 0
     if code == 401: die(2, "鉴权失败(401)：cookie 过期/不全，重新导出（AGENT_SPEC §4）")
     if code == 429: die(3, "配额不足(429)：" + body[:200])
+    if code in (403, 404):
+        die(4, f"{code}：api_key/host 可能过期，或文件不可访问/无权限。\n"
+               f"已自动重新发现过仍失败 → 检查链接权限；或删掉 config 里 api_key/host 后重跑")
     if code == 400:
         if "XD3" in body: die(4, "XD3 拦截：本工具不应带 origin 头，检查代理是否注入（AGENT_SPEC §6.4）")
         die(4, "协议变更(400)：" + body[:300] + "\n按 AGENT_SPEC §6.1 更新 client_build")
     die(4, f"意外状态 {code}: {body[:200]}")
 
 # ---------------- 入口 ----------------
+def parse_file_id(target: str) -> str:
+    """支持 /file/d/<id>/、open?id=<id>、uc?id=<id>、裸 ID；docs 链接给出警告（MIME 硬编码 pdf）"""
+    m = (re.search(r"/d/([a-zA-Z0-9_-]{20,})", target)
+         or re.search(r"[?&]id=([a-zA-Z0-9_-]{20,})", target))
+    if "docs.google.com" in target:
+        print("[warn] docs.google.com 链接：本工具 MIME 固定为 application/pdf，"
+              "非 Drive PDF（Docs/Sheets 等）可能失败", file=sys.stderr)
+    return m.group(1) if m else target
+
+def parse_quota(body: str) -> str:
+    """quotaSummary JSON-protobuf → 可读行。ponytail: 字段语义未逆向，取前两个数字串按 剩余/总量 展示（启发式）"""
+    try:
+        nums = [s for s in re.findall(r'\"(\d+)\"', body)]
+        if len(nums) >= 2:
+            return f"[quota] 剩余 {nums[0]} / 总量 {nums[1]}（字段语义为启发式解读）"
+    except Exception:
+        pass
+    return "[quota] 无法解析，原始响应如下"
+
 def main():
     ap = argparse.ArgumentParser(description="Drive Gemini 摘要（纯 HTTP）")
-    ap.add_argument("target", nargs="?", help="Drive 链接或文件 ID")
+    ap.add_argument("target", nargs="?", help="Drive 链接或文件 ID（--quota 可省略）")
     ap.add_argument("--prompt", help="提示词（默认取配置文件）")
     ap.add_argument("--config", default=os.environ.get("DRIVE_CONFIG",
                        os.path.expanduser("~/.drive_summarize/config.json")))
     ap.add_argument("--out", help="输出到文件（默认 stdout）")
-    ap.add_argument("--cookie-file", help="cookie JSON 文件路径（任意位置；优先于配置与环境变量）")
+    ap.add_argument("--cookie-file", help="cookie JSON 文件路径（任意位置；最高优先级）")
     ap.add_argument("--cookie-key", help="JSON 里有多个候选时指定用哪个键（默认第一个并打印）")
-    ap.add_argument("--quota", action="store_true", help="只查配额")
+    ap.add_argument("--quota", action="store_true", help="只查配额（可不带文件链接）")
     ap.add_argument("--selftest", action="store_true", help="离线自检（不联网）")
     args = ap.parse_args()
 
     if args.selftest:
         selftest(); print("selftest OK"); return
 
-    if not args.target:
-        die(5, "需要 Drive 链接或文件 ID（--help 看用法）")
-    m = re.search(r"/d/([a-zA-Z0-9_-]{20,})", args.target)
-    file_id = m.group(1) if m else args.target
-
     cfg = load_config(args.config)
     cookie = load_cookie(cfg, args.config, args.cookie_file, args.cookie_key)
-    autodiscover(file_id, cfg, args.config)
+
+    if args.quota and not args.target:      # 配额查询不依赖具体文件
+        if not (cfg.get("api_key") and cfg.get("host")):
+            die(5, "无缓存 api_key/host：请先带文件链接跑一次（或设置 --config 指向已有配置）")
+    else:
+        if not args.target:
+            die(5, "需要 Drive 链接或文件 ID（--help 看用法）")
+        file_id = parse_file_id(args.target)
+        autodiscover(file_id, cfg, args.config)
 
     if args.quota:
         code, body = post(f"https://{cfg['host']}/v1/genai/quotaSummary?key={cfg['api_key']}",
                           "[null,1,[19]]", cookie, timeout=30)
+        if code == 404:   # key/host 过期：清缓存重发现一次再试
+            cfg.update({"api_key": None, "host": None, "_fetched_at": 0})
+            save_config(args.config, cfg)
+            die(4, "404：缓存的 api_key/host 已失效，已自动清空，请重跑本命令重新发现")
         status_exit(code, body)
+        print(parse_quota(body))
         print(body); return
 
-    code, body = post(f"https://{cfg['host']}/v1/genai/streamGenerate?key={cfg['api_key']}",
-                      build_body(file_id, args.prompt or cfg["prompt"], cfg), cookie)
+    def gen_url():
+        return f"https://{cfg['host']}/v1/genai/streamGenerate?key={cfg['api_key']}"
+
+    code, body = post(gen_url(), build_body(file_id, args.prompt or cfg["prompt"], cfg), cookie)
+    if code in (403, 404):   # key/host 可能过期：强制重发现一次再试
+        print(f"[retry] {code} → 清空缓存 key/host 重新自动发现", file=sys.stderr)
+        cfg.update({"api_key": None, "host": None, "_fetched_at": 0})
+        autodiscover(file_id, cfg, args.config)
+        code, body = post(gen_url(), build_body(file_id, args.prompt or cfg["prompt"], cfg), cookie)
     status_exit(code, body)
     text = extract_text(body)
     if args.out:
@@ -282,6 +340,16 @@ def selftest():
     assert len(got) == 1 and "SID=s" in got[0][1] and "SAPISID=p" in got[0][1]
     assert from_curl("curl 'https://x' -H 'cookie: SID=a; SAPISID=b'") == "SID=a; SAPISID=b"
     assert from_curl("SID=a; SAPISID=b;") == "SID=a; SAPISID=b"
+    # 5) cURL 其他形态 / 链接解析 / dict 节点文本提取 / 配额解析
+    assert from_curl("curl 'x' --header 'Cookie: SID=a; SAPISID=b'") == "SID=a; SAPISID=b"
+    assert from_curl("curl 'x' -b 'SID=a; SAPISID=b'") == "SID=a; SAPISID=b"
+    fid = "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    assert parse_file_id(f"https://drive.google.com/file/d/{fid}/view") == fid
+    assert parse_file_id(f"https://drive.google.com/open?id={fid}") == fid
+    assert parse_file_id(f"https://drive.google.com/uc?export=download&id={fid}") == fid
+    assert parse_file_id(fid) == fid
+    assert extract_text(json.dumps({"k": [[[[[[["从dict里冒出来的文本内容", ["x"]]]]]]]]})) == "从dict里冒出来的文本内容"
+    assert "剩余" in parse_quota('[[null,["999999",null,"888",3]]]')
 
 if __name__ == "__main__":
     main()
