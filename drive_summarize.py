@@ -34,7 +34,7 @@ import argparse, hashlib, json, os, re, ssl, sys, tempfile, time, urllib.request
 # ---- 内置兜底值（自动抓取失败时使用；来源见 AGENT_SPEC） ----
 DEFAULT_KEY = "AIzaSyDVQw45DwoYh632gvsP5vPDqEKvb-Ywnb8"
 DEFAULT_HOST = "appsgenaiserver-pa.clients6.google.com"
-DEFAULT_BUILD = "goog_1178929964"          # 会随 Drive 前端发版漂移 → config 可覆盖
+DEFAULT_BUILD = "goog_618132029"          # 2026-11-06 实测；会随 Drive 前端发版漂移 → config 可覆盖
 ORIGIN = "https://drive.google.com"        # SAPISIDHASH hash 用，勿改
 REFRESH_AFTER = 30 * 86400                 # key/host 缓存有效期（秒）
 
@@ -194,11 +194,39 @@ def build_body(file_id: str, prompt: str, cfg: dict) -> str:
         None, [1, None, [[None, "1", 1182]]], 1],
         [1, None, 1]], ensure_ascii=False, separators=(",", ":"))
 
+def _primary_message_text(msg) -> str:
+    """Extract the full Markdown from one stream message.
+
+    The final server message carries the complete answer at this stable nesting;
+    earlier messages carry incremental prefixes/fragments.  Prefer this over
+    collecting every string in the whole stream (which duplicates the answer).
+    """
+    try:
+        text = msg[0][0][0][0][0][0][0]
+        if isinstance(text, str) and len(text) >= 20:
+            return text.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def extract_text(resp: str) -> str:
-    """流式 JSON-protobuf → 文本。规则：整段先出、分段/累积分段为其子串 → 只保留互不包含的最大串。
-    ponytail: 启发式提取（已知漏网：starter tiles/元数据串），若输出混入噪音，过滤规则在此加。"""
-    try: tree = json.loads(resp)
-    except Exception: return resp
+    """流式 JSON-protobuf → 文本。
+
+    优先取最后一条消息里的完整 Markdown（实测结构最稳）；取不到再退回
+    “收集长字符串、去掉子串”的启发式，避免旧响应格式失效。
+    """
+    try:
+        tree = json.loads(resp)
+    except Exception:
+        return resp
+
+    messages = tree[0] if isinstance(tree, list) and tree and isinstance(tree[0], list) else []
+    for msg in reversed(messages):
+        text = _primary_message_text(msg)
+        if text:
+            return text
+
     keep = []
     def walk(n):
         if isinstance(n, str):
@@ -220,9 +248,13 @@ def post(url: str, body: str, cookie: str, timeout: int = 180):
     req.add_header("content-type", "application/json+protobuf; charset=UTF-8")
     req.add_header("authorization", sapisidhash(cookie))
     req.add_header("cookie", cookie)
+    # 2026-11-06 实测：当前 streamGenerate 需要正确的 drive origin；
+    # 只有错误 origin / x-origin 才会触发 XD3。
+    req.add_header("origin", "https://drive.google.com")
+    req.add_header("referer", "https://drive.google.com/")
     req.add_header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-    # 铁律：不带 origin / x-origin（触发 400 XD3）
+    # 旧注释保留：错误 origin / x-origin 会触发 XD3；当前实测正确 origin 必需。
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace")
@@ -361,7 +393,9 @@ def selftest():
     assert msg[4] == "goog_TEST" and msg[13] == "zh-CN" and msg[34] == "Asia/Shanghai"
     assert '["FILEID1234567890abcdefgh",null,"application/pdf"]' in raw   # 文件ID+mime 位
     assert '"提示词内容"' in raw
-    # 3) 文本提取：整段+分段+累积扩展，只留最大串且顺序稳定
+    # 3) 文本提取：优先取最后一条消息的完整 Markdown；旧格式仍走启发式
+    primary = [[[[[[["完整摘要内容"]]]]]]]
+    assert extract_text(json.dumps([[primary]])) == "完整摘要内容"
     chunk = lambda s: [[[[[[s, ["x", s]]]]]]]      # 每条流式消息的嵌套形态
     resp = json.dumps([chunk("完整摘要第一段内容在此"),
                        chunk("完整摘要第一段内容在此还有第二段")])

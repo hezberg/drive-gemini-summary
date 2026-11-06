@@ -60,8 +60,8 @@ Cookie precedence: `--cookie-file` arg > `DRIVE_COOKIE_FILE` / `DRIVE_COOKIE` en
 
 ## Notes & limits
 
-- Never send `origin`/`x-origin` headers with the request — it triggers a `400 XD3` rejection.
-- The client build id (`goog_1178929964` at the time of reversing) drifts with Drive releases;
+- Send `origin: https://drive.google.com` (required by the live endpoint as of 2026-11-06); never send `x-origin` or a wrong origin — it triggers a `400 XD3` rejection.
+- The client build id (`goog_618132029` at the time of this fix) drifts with Drive releases;
   pin a new one with `--client-build goog_...` (persisted to config, never auto-overwritten),
   see AGENT_SPEC §6.1 for details.
 - Cookies are full account credentials: keep the JSON file private (`chmod 600`).
