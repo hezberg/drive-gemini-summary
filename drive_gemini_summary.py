@@ -6,7 +6,7 @@ Drive「问问 Gemini」摘要 — 纯 HTTP 复放脚本（不开网页）
      请求头里的整串 cookie 复制下来（必须含 SAPISID、SID、HSID、SSID、__Secure-1PSID 等）
   2. python3 drive_gemini_summary.py "<drive文件ID或链接>" --cookie '<整串cookie>' [--prompt '总结这份文件']
 协议: apps_intelligence.gen_ai.GenAiService/StreamGenerate @ appsgenaiserver-pa.clients6.google.com
-      鉴权: SAPISIDHASH <t>_<sha1(t + " " + SAPISID + " " + origin)>  (不要带 x-origin 头, 会触发 XD3 拦截)
+      鉴权: SAPISIDHASH <t>_<sha1(t + " " + SAPISID + " " + origin)>  (需带正确 origin: https://drive.google.com；不要带 x-origin)
 依赖: 仅标准库
 """
 import argparse, hashlib, json, re, sys, time, urllib.request, uuid
@@ -14,7 +14,7 @@ import argparse, hashlib, json, re, sys, time, urllib.request, uuid
 KEY = "AIzaSyDVQw45DwoYh632gvsP5vPDqEKvb-Ywnb8"   # 公开浏览器 key（页面下发，非密钥）
 URL = ("https://appsgenaiserver-pa.clients6.google.com/v1/genai/streamGenerate?key=" + KEY)
 ORIGIN = "https://drive.google.com"
-CLIENT_BUILD = "goog_1178929964"                  # 页面内置客户端构建号，随版本可能变化
+CLIENT_BUILD = "goog_618132029"                  # 2026-11-06 实测，随版本可能变化
 
 def build_body(file_id: str, prompt: str) -> str:
     return json.dumps([[
@@ -39,11 +39,19 @@ def sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {t}_{digest}"
 
 def extract_text(resp: str) -> str:
-    """响应是流式 JSON-protobuf 数组；收集其中按序出现的长文本段并去掉重复子串"""
+    """流式 JSON-protobuf → 文本；优先取最后一条消息的完整 Markdown。"""
     try:
         tree = json.loads(resp)
     except Exception:
         return resp
+    messages = tree[0] if isinstance(tree, list) and tree and isinstance(tree[0], list) else []
+    for msg in reversed(messages):
+        try:
+            text = msg[0][0][0][0][0][0][0]
+            if isinstance(text, str) and len(text) >= 20:
+                return text.strip()
+        except Exception:
+            pass
     seen, out = [], []
     def walk(node):
         if isinstance(node, str):
@@ -76,9 +84,11 @@ def main():
     req.add_header("content-type", "application/json+protobuf; charset=UTF-8")
     req.add_header("authorization", sapisidhash(sapisid.group(1)))
     req.add_header("cookie", cookie)
+    req.add_header("origin", "https://drive.google.com")
+    req.add_header("referer", "https://drive.google.com/")
     req.add_header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-    # 注意: 不要加 origin / x-origin 头 —— 会触发 XD3 Origin!=Host 拦截
+    # 2026-11-06 实测: 正确 origin 必需；错误 origin / x-origin 会触发 XD3 拦截
 
     with urllib.request.urlopen(req, timeout=120) as r:
         raw = r.read().decode("utf-8", "replace")

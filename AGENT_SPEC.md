@@ -41,7 +41,7 @@ User-Agent:    任意现代浏览器 UA
 ```
 
 **铁律：**
-1. **绝对不能发送 `origin` 或 `x-origin` 头** → 一带就 400 `Origin doesn't match Host for XD3`。
+1. **必须发送正确的 `origin: https://drive.google.com`**（当前 `streamGenerate` 实测必需）；不要发送 `x-origin`，错误 origin 会触发 400 `Origin doesn't match Host for XD3`。
 2. SAPISIDHASH 的 hash 输入第三段**必须是** `https://drive.google.com`（页面 origin），
    用 `https://clients6.google.com` 会 401。
 3. Cookie 必须完整（见 §4）；`document.cookie` 只能拿到非 HttpOnly 的一半，不够。
@@ -64,7 +64,7 @@ JSON 数组编码的 protobuf（`application/json+protobuf`：`null`=字段缺�
 
 ```json
 [[15,null,
-  [19,null,null,null,"goog_1178929964",[null,null,null,null,[0]],"1",null,
+  [19,null,null,null,"goog_618132029",[null,null,null,null,[0]],"1",null,
    [null,null,null,
     [[[null,null,null,null,null,null,null,
        [null,null,[null,null,null,["<FILE_ID>",null,"application/pdf"]]]]]]],
@@ -83,7 +83,7 @@ JSON 数组编码的 protobuf（`application/json+protobuf`：`null`=字段缺�
 
 | 片段 | 含义 | 稳定性 |
 |---|---|---|
-| `goog_1178929964` | 客户端构建号 | **易变**，随 Drive 前端发版更新（维护见 §6.1） |
+| `goog_618132029` | 客户端构建号 | **易变**，随 Drive 前端发版更新（维护见 §6.1） |
 | `"1"`（构建号后第 3 位） | 会话轮次：`0`=取建议提示词(starter tiles)，`1`=首次生成，`2+`=追问（需带历史） | 稳定 |
 | `<FILE_ID>` + `"application/pdf"` | Drive 资源引用（文件 ID + MIME） | 稳定；其他 MIME 应同理 |
 | `[3,0]` | 未知（疑似 surface 标记） | 照抄 |
@@ -127,7 +127,7 @@ e2e 断言：HTTP 200 且提取文本含上述关键词之一。
 | 404 空响应 | 未带 Cookie 探测 / key 错 / 路径错 | 检查 key 与完整请求头 |
 | 401 `API keys are not supported…Expected OAuth2` | 只带了 key，没带 Authorization | 加 SAPISIDHASH |
 | 401 `Request had invalid authentication credentials…login cookie` | Cookie 不全（缺 HttpOnly 项）或 SAPISIDHASH 算错/过期 | 重新导出完整 Cookie；核对 hash 三段格式 |
-| 400 `Origin doesn't match Host for XD3` | 请求带了 `origin`/`x-origin` 头 | **删掉这两个头** |
+| 400 `Origin doesn't match Host for XD3` | 请求带了错误 `origin`/`x-origin`（必须带正确 drive origin） | 改为 `origin: https://drive.google.com`，删除 `x-origin` |
 | 400 其他 bad request | 请求体结构错 / 构建号过期 / UUID 格式错 | 对照 §2.3 模板逐字段 diff；更新构建号 |
 | 429 / quota | 配额耗尽 | 调 `quotaSummary` 展示余量；次日再试 |
 | 响应 200 但文本为空 | prompt 被安全策略吞 / 文件无可提取文本 | 换 prompt 重试；确认文件是文本型 PDF |
@@ -206,7 +206,7 @@ HTTP POST streamGenerate（超时 ≥120s；大文件响应可达 1.5MB+）
 ### 6.1 构建号漂移（最可能的失效点）
 
 - **症状**：长期 400 bad request，而 Cookie 刚导过、模板没动过。
-- **定位**：`goog_1178929964` 过期。
+- **定位**：`goog_618132029` 过期。
 - **更新方法 A（推荐，1 分钟）**：登录浏览器抓一次包（§4.2），从请求体第 8 个字段抄新构建号。
 - **更新方法 B（无抓包条件）**：下载当前 Drive 前端 JS 搜索——
   ```
@@ -232,7 +232,7 @@ HTTP POST streamGenerate（超时 ≥120s；大文件响应可达 1.5MB+）
 
 ### 6.4 已知不该做的事（前人踩坑，勿重复）
 
-- ❌ 带 `origin`/`x-origin` 头（400 XD3）
+- ❌ 带错误 `origin`/`x-origin`（400 XD3）；正确 `origin: https://drive.google.com` 是必需项
 - ❌ 用 `clients6.google.com` 做 hash origin（401）
 - ❌ 只用 `document.cookie` 收集 Cookie（401）
 - ❌ 匿名探测端点做健康检查（一律 404，会误报协议死了）
@@ -257,7 +257,7 @@ HTTP POST streamGenerate（超时 ≥120s；大文件响应可达 1.5MB+）
 | 维度 | Drive PDF 查看器 | Sheets |
 |---|---|---|
 | 端点/鉴权/key | `appsgenaiserver-pa.clients6.google.com/v1/genai/*` + SAPISIDHASH | **完全相同**（实测 200） |
-| 客户端构建号 | `goog_1178929964` | `goog_424115329`（**每个 App 独立**） |
+| 客户端构建号 | `goog_618132029` | `goog_424115329`（**每个 App 独立**） |
 | App/surface 枚举 | `[19,...]` | `[3,...]` |
 | 资源引用 | `[fileId, null, "application/pdf"]` | `[fileId, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 1, <选区JSON>, 0, "<revision如2dd_hbqH5216zQ>", ...]` |
 | 选区上下文 | 无 | **有**：sheet gid、选中范围、单元格内值、视口尺寸 [w,h]（AI 能看到当前选中数据） |
